@@ -254,3 +254,86 @@ class SymbolicObserver:
                             print(f"      -> Future hidden jump discovered: {loc} --{event}--> {target}")
                             
         return closure
+    
+    def build_observer_graph(self) -> dict:
+        """
+        Builds the complete Symbolic Observer Graph.
+        Nodes represent the 'Delayed Macrostate' (Arrival + Time Elapse + Unobservable Cascades).
+        """
+        print("\n  [Building Observer Graph] Starting BFS exploration...")
+
+        def get_macrostate(base_belief: set) -> frozenset:
+            """
+            Takes raw arrival states (like x4 [0,0]), stretches time to infinity,
+            and discovers all unobservable states reached during that wait.
+            """
+            # 1. Stretch time (simulate waiting forever)
+            delayed = set()
+            for s in base_belief:
+                delayed.add(SymbolicState(s.location, s.interval.up()))
+            
+            # 2. Find all unobservable states reached during this wait
+            closure = set(delayed)
+            worklist = list(delayed)
+            
+            while worklist:
+                curr = worklist.pop(0)
+                for trans in self.transitions:
+                    src, evt, tgt = trans
+                    if src == curr.location and evt in self.unobservable_events:
+                        guard = self._get_guard(trans)
+                        intersected = curr.interval.intersect(guard)
+                        
+                        if not intersected.is_empty():
+                            new_int = self._apply_reset(intersected, trans)
+                            
+                            # CRUCIAL: Time continues passing after the hidden event fires!
+                            future_int = new_int.up() 
+                            new_state = SymbolicState(tgt, future_int)
+                            
+                            if new_state not in closure:
+                                closure.add(new_state)
+                                worklist.append(new_state)
+                                
+            return frozenset(closure)
+
+        # Start BFS with the fully expanded initial macrostate
+        initial_macrostate = get_macrostate(self.current_belief)
+        
+        graph = {}
+        queue = [initial_macrostate]
+        visited = {initial_macrostate}
+        
+        observable_transitions = [t for t in self.transitions if t[1] not in self.unobservable_events]
+        unique_obs_events = {t[1] for t in observable_transitions}
+        
+        while queue:
+            current_macrostate = queue.pop(0)
+            graph[current_macrostate] = []
+            
+            # Apply Observable Events (The Slicer)
+            for obs_event in unique_obs_events:
+                next_arrival_belief = set()
+                
+                for state in current_macrostate:
+                    for trans in self.transitions:
+                        src, evt, tgt = trans
+                        if src == state.location and evt == obs_event:
+                            guard = self._get_guard(trans)
+                            valid_int = state.interval.intersect(guard)
+                            
+                            if not valid_int.is_empty():
+                                final_int = self._apply_reset(valid_int, trans)
+                                next_arrival_belief.add(SymbolicState(tgt, final_int))
+                                
+                if next_arrival_belief:
+                    # Expand the raw arrivals into the full Delayed Macrostate
+                    next_macrostate = get_macrostate(next_arrival_belief)
+                    
+                    graph[current_macrostate].append((obs_event, next_macrostate))
+                    
+                    if next_macrostate not in visited:
+                        visited.add(next_macrostate)
+                        queue.append(next_macrostate)
+                        
+        return graph
