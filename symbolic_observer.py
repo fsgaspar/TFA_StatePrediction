@@ -346,8 +346,69 @@ class SymbolicObserver:
         return graph
     
     def build_time_segmented_graph(self) -> dict:
-        print("\n  [Building Segmented Graph] Utilizing Clock-Interval Advance (Zone) Logic...")
+        print("\n  [Building Segmented Graph] Utilizing Clock-Interval Advance (Zone) Logic with Subsumption & Normalization...")
 
+        # ==========================================
+        # Protection 1: k-Normalization Helpers
+        # ==========================================
+        def get_global_k() -> float:
+            """Finds the maximum upper bound used in any guard across the entire automaton."""
+            max_k = 0.0
+            for trans in self.transitions:
+                guard = self._get_guard(trans)
+                if guard.lower != float('inf') and guard.lower > max_k: 
+                    max_k = guard.lower
+                if guard.upper != float('inf') and guard.upper > max_k: 
+                    max_k = guard.upper
+            return max_k
+
+        global_k = get_global_k()
+        print(f"  [System] Calculated Global k-ceiling for normalization: {global_k}")
+
+        def normalize_interval(l: float, u: float, k: float) -> tuple:
+            """Extrapolates clocks beyond the k-ceiling to infinity."""
+            if l > k:
+                return float('inf'), float('inf')
+            if u > k:
+                return l, float('inf')
+            return l, u
+
+        def normalize_macrostate(macrostate: frozenset, k: float) -> frozenset:
+            normalized_states = set()
+            for state in macrostate:
+                l, u = normalize_interval(state.interval.lower, state.interval.upper, k)
+                normalized_states.add(SymbolicState(state.location, TimeInterval(l, u, True, True)))
+            return frozenset(normalized_states)
+
+        # ==========================================
+        # Protection 2: Zone Subsumption Helper
+        # ==========================================
+        def is_subsumed(new_macro: frozenset, visited_list: list) -> bool:
+            """Checks if a new macrostate is completely covered by an already visited macrostate."""
+            for visited_macro in visited_list:
+                all_covered = True
+                
+                for n_state in new_macro:
+                    state_covered = False
+                    for v_state in visited_macro:
+                        if n_state.location == v_state.location:
+                            # Subsumption: new interval is a subset of the visited interval
+                            if n_state.interval.lower >= v_state.interval.lower and \
+                               n_state.interval.upper <= v_state.interval.upper:
+                                state_covered = True
+                                break
+                                
+                    if not state_covered:
+                        all_covered = False
+                        break
+                        
+                if all_covered:
+                    return True # Fully subsumed by this visited macrostate!
+            return False
+
+        # ==========================================
+        # Existing Logic Helpers (Adapted for inf bounds)
+        # ==========================================
         def get_max_upper_bound(location: str) -> float:
             max_ub = -1.0
             has_transitions = False
@@ -360,10 +421,11 @@ class SymbolicObserver:
             return max_ub if has_transitions else float('inf')
 
         def get_time_step(macrostate: frozenset) -> float:
-            """Finds the smallest exact time delta 'd' to the next logical boundary."""
             deltas = set()
             for state in macrostate:
                 l, u = state.interval.lower, state.interval.upper
+                if l == float('inf') or u == float('inf'): continue 
+                
                 for trans in self.transitions:
                     if trans[0] == state.location:
                         g = self._get_guard(trans)
@@ -381,7 +443,6 @@ class SymbolicObserver:
             return min(deltas) if deltas else float('inf')
 
         def apply_instant_closure(base_states: set) -> frozenset:
-            """Applies unobservable closure instantaneously (e.g., right after an observation)."""
             closure = {s.location: [s.interval.lower, s.interval.upper] for s in base_states}
             worklist = list(base_states)
             
@@ -395,7 +456,7 @@ class SymbolicObserver:
                         g = self._get_guard(trans)
                         int_l, int_u = max(l, g.lower), min(u, g.upper)
                         
-                        if int_l <= int_u:  # Firing is valid right now
+                        if int_l <= int_u:
                             reset = self._get_reset(trans)
                             new_l = reset.lower if reset else int_l
                             new_u = reset.upper if reset else int_u
@@ -405,7 +466,7 @@ class SymbolicObserver:
                                 merged_l, merged_u = min(old_l, new_l), max(old_u, new_u)
                                 if merged_l < old_l or merged_u > old_u:
                                     closure[tgt] = [merged_l, merged_u]
-                                    worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                                    worklist.append(SymbolicState(tgt, TimeInterval(merged_l, merged_u, True, True)))
                             else:
                                 closure[tgt] = [new_l, new_u]
                                 worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
@@ -413,28 +474,28 @@ class SymbolicObserver:
             return frozenset(SymbolicState(loc, TimeInterval(l, u, True, True)) for loc, (l, u) in closure.items())
 
         def apply_time_step_and_closure(macrostate: frozenset, d: float) -> frozenset:
-            """Advances clocks by 'd' and evaluates unobservable transitions that fire DURING the step."""
             final_intervals = {}
-            
-            # 1. Advance existing timelines
             for state in macrostate:
                 l, u = state.interval.lower, state.interval.upper
+                if l == float('inf'): 
+                    final_intervals[state.location] = [float('inf'), float('inf')]
+                    continue
+                    
                 max_ub = get_max_upper_bound(state.location)
                 if l + d <= max_ub or max_ub == float('inf'):
-                    final_intervals[state.location] = [l + d, u + d]
+                    final_intervals[state.location] = [l + d, u + d if u != float('inf') else float('inf')]
 
-            # 2. Evaluate unobservable cascades during step 'd'
             worklist = list(macrostate)
             while worklist:
                 curr = worklist.pop(0)
                 l, u = curr.interval.lower, curr.interval.upper
+                if l == float('inf'): continue
                 
                 for trans in self.transitions:
                     src, evt, tgt = trans
                     if src == curr.location and evt in self.unobservable_events:
                         g, L, U = self._get_guard(trans), self._get_guard(trans).lower, self._get_guard(trans).upper
                         
-                        # Calculate exact window where firing was valid DURING the step
                         t_min = max(0.0, L - u)
                         t_max = min(d, U - l)
                         
@@ -445,14 +506,14 @@ class SymbolicObserver:
                                 new_u = reset.upper + min(d, d - L + u)
                             else:
                                 new_l = max(l + d, L)
-                                new_u = min(u + d, U + d)
+                                new_u = min(u + d if u != float('inf') else float('inf'), U + d)
                             
                             if tgt in final_intervals:
                                 old_l, old_u = final_intervals[tgt]
                                 merged_l, merged_u = min(old_l, new_l), max(old_u, new_u)
                                 if merged_l < old_l or merged_u > old_u:
                                     final_intervals[tgt] = [merged_l, merged_u]
-                                    worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                                    worklist.append(SymbolicState(tgt, TimeInterval(merged_l, merged_u, True, True)))
                             else:
                                 final_intervals[tgt] = [new_l, new_u]
                                 worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
@@ -463,11 +524,13 @@ class SymbolicObserver:
         # Main Graph Construction
         # ==========================================
         graph = {}
-        # Apply instant closure to account for unobservables valid at exact start time
-        initial_macrostate = apply_instant_closure(set(self.current_belief))
+        
+        # Apply instant closure and immediately normalize the initial state
+        raw_initial = apply_instant_closure(set(self.current_belief))
+        initial_macrostate = normalize_macrostate(raw_initial, global_k)
         
         queue = [initial_macrostate]
-        visited = {initial_macrostate}
+        visited_macros = [initial_macrostate]  # Switched to a List to evaluate Subsumption logic
         
         observable_transitions = [t for t in self.transitions if t[1] not in self.unobservable_events]
         unique_obs_events = {t[1] for t in observable_transitions}
@@ -480,36 +543,54 @@ class SymbolicObserver:
             # --- PHASE 1: Time Passage ---
             d = get_time_step(curr_macro)
             if d > 0 and d != float('inf'):
-                next_macro_time = apply_time_step_and_closure(curr_macro, d)
-                if next_macro_time:
-                    edge_label = f"time -> {d}"
+                raw_next_time = apply_time_step_and_closure(curr_macro, d)
+                if raw_next_time:
+                    
+                    # Normalize before saving or evaluating
+                    next_macro_time = normalize_macrostate(raw_next_time, global_k)
+                    
+                    edge_label = f"time -> {round(d, 4)}"
                     graph[curr_macro].append((edge_label, next_macro_time))
-                    if next_macro_time not in visited:
-                        visited.add(next_macro_time)
+                    if next_macro_time not in graph:
+                        graph[next_macro_time] = []
+                    # ONLY enqueue if this state discovers new information (is not subsumed)
+                    if not is_subsumed(next_macro_time, visited_macros):
+                        visited_macros.append(next_macro_time)
                         queue.append(next_macro_time)
                         
             # --- PHASE 2: Observable Events ---
             for obs_event in unique_obs_events:
                 arrivals = set()
                 for state in curr_macro:
+                    if state.interval.lower == float('inf'): continue 
+
                     for trans in self.transitions:
                         src, evt, tgt = trans
                         if src == state.location and evt == obs_event:
                             g = self._get_guard(trans)
                             l, u = state.interval.lower, state.interval.upper
-                            int_l, int_u = max(l, g.lower), min(u, g.upper)
                             
-                            if int_l <= int_u: # Observable enabled right now
+                            int_l = max(l, g.lower)
+                            int_u = min(u, g.upper)
+                            
+                            if int_l <= int_u:
                                 reset = self._get_reset(trans)
                                 new_l = reset.lower if reset else int_l
                                 new_u = reset.upper if reset else int_u
                                 arrivals.add(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
                 
                 if arrivals:
-                    next_macro_obs = apply_instant_closure(arrivals)
+                    raw_next_obs = apply_instant_closure(arrivals)
+                    
+                    # Normalize before saving or evaluating
+                    next_macro_obs = normalize_macrostate(raw_next_obs, global_k)
+                    
                     graph[curr_macro].append((obs_event, next_macro_obs))
-                    if next_macro_obs not in visited:
-                        visited.add(next_macro_obs)
+                    if next_macro_obs not in graph:
+                        graph[next_macro_obs] = []
+                    # ONLY enqueue if this state discovers new information (is not subsumed)
+                    if not is_subsumed(next_macro_obs, visited_macros):
+                        visited_macros.append(next_macro_obs)
                         queue.append(next_macro_obs)
 
         return graph
