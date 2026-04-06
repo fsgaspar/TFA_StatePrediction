@@ -158,8 +158,10 @@ if __name__ == "__main__":
     obs_graph3 = observer3.build_observer_graph()
     obs_graph4 = observer4.build_observer_graph()
     obs_graph5 = observer5.build_observer_graph()
+
+    obs_graph3_timed = observer3.build_time_segmented_graph()
     # 2. Draw it to a PDF!
     #draw_observer_graph(obs_graph2, filename="TFA_Example_2_Graph")
     #draw_observer_graph(obs_graph3, filename="TFA_Example_3_Graph")
     #draw_observer_graph(obs_graph4, filename="TFA_Example_4_Graph")
-    draw_observer_graph(obs_graph5, filename="TFA_Example_5_Graph")
+    draw_observer_graph(obs_graph3_timed, filename="TFA_Example_3_Timed_Graph")

@@ -16,6 +16,13 @@ class SymbolicObserver:
         lower, upper, l_inc, u_inc = self.timing_func(transition)
         return TimeInterval(lower, upper, l_inc, u_inc)
 
+    def _get_reset(self, transition: tuple):
+        """Fetches the reset bounds and converts them to a TimeInterval."""
+        reset_data = self.reset_func(transition)
+        if reset_data is None:
+            return None
+        return TimeInterval(*reset_data)
+
     def _apply_reset(self, interval: TimeInterval, transition: tuple) -> TimeInterval:
         if self.reset_func(transition) is not None:
             return interval.reset()
@@ -336,4 +343,173 @@ class SymbolicObserver:
                         visited.add(next_macrostate)
                         queue.append(next_macrostate)
                         
+        return graph
+    
+    def build_time_segmented_graph(self) -> dict:
+        print("\n  [Building Segmented Graph] Utilizing Clock-Interval Advance (Zone) Logic...")
+
+        def get_max_upper_bound(location: str) -> float:
+            max_ub = -1.0
+            has_transitions = False
+            for t in self.transitions:
+                if t[0] == location:
+                    has_transitions = True
+                    ub = self._get_guard(t).upper
+                    if ub == float('inf'): return float('inf')
+                    if ub > max_ub: max_ub = ub
+            return max_ub if has_transitions else float('inf')
+
+        def get_time_step(macrostate: frozenset) -> float:
+            """Finds the smallest exact time delta 'd' to the next logical boundary."""
+            deltas = set()
+            for state in macrostate:
+                l, u = state.interval.lower, state.interval.upper
+                for trans in self.transitions:
+                    if trans[0] == state.location:
+                        g = self._get_guard(trans)
+                        if g.lower != float('inf'):
+                            if g.lower - u > 0: deltas.add(g.lower - u)
+                            if g.lower - l > 0: deltas.add(g.lower - l)
+                        if g.upper != float('inf'):
+                            if g.upper - u > 0: deltas.add(g.upper - u)
+                            if g.upper - l > 0: deltas.add(g.upper - l)
+                
+                max_ub = get_max_upper_bound(state.location)
+                if max_ub != float('inf'):
+                    if max_ub - u > 0: deltas.add(max_ub - u)
+                    if max_ub - l > 0: deltas.add(max_ub - l)
+            return min(deltas) if deltas else float('inf')
+
+        def apply_instant_closure(base_states: set) -> frozenset:
+            """Applies unobservable closure instantaneously (e.g., right after an observation)."""
+            closure = {s.location: [s.interval.lower, s.interval.upper] for s in base_states}
+            worklist = list(base_states)
+            
+            while worklist:
+                curr = worklist.pop(0)
+                l, u = curr.interval.lower, curr.interval.upper
+                
+                for trans in self.transitions:
+                    src, evt, tgt = trans
+                    if src == curr.location and evt in self.unobservable_events:
+                        g = self._get_guard(trans)
+                        int_l, int_u = max(l, g.lower), min(u, g.upper)
+                        
+                        if int_l <= int_u:  # Firing is valid right now
+                            reset = self._get_reset(trans)
+                            new_l = reset.lower if reset else int_l
+                            new_u = reset.upper if reset else int_u
+                            
+                            if tgt in closure:
+                                old_l, old_u = closure[tgt]
+                                merged_l, merged_u = min(old_l, new_l), max(old_u, new_u)
+                                if merged_l < old_l or merged_u > old_u:
+                                    closure[tgt] = [merged_l, merged_u]
+                                    worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                            else:
+                                closure[tgt] = [new_l, new_u]
+                                worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                                
+            return frozenset(SymbolicState(loc, TimeInterval(l, u, True, True)) for loc, (l, u) in closure.items())
+
+        def apply_time_step_and_closure(macrostate: frozenset, d: float) -> frozenset:
+            """Advances clocks by 'd' and evaluates unobservable transitions that fire DURING the step."""
+            final_intervals = {}
+            
+            # 1. Advance existing timelines
+            for state in macrostate:
+                l, u = state.interval.lower, state.interval.upper
+                max_ub = get_max_upper_bound(state.location)
+                if l + d <= max_ub or max_ub == float('inf'):
+                    final_intervals[state.location] = [l + d, u + d]
+
+            # 2. Evaluate unobservable cascades during step 'd'
+            worklist = list(macrostate)
+            while worklist:
+                curr = worklist.pop(0)
+                l, u = curr.interval.lower, curr.interval.upper
+                
+                for trans in self.transitions:
+                    src, evt, tgt = trans
+                    if src == curr.location and evt in self.unobservable_events:
+                        g, L, U = self._get_guard(trans), self._get_guard(trans).lower, self._get_guard(trans).upper
+                        
+                        # Calculate exact window where firing was valid DURING the step
+                        t_min = max(0.0, L - u)
+                        t_max = min(d, U - l)
+                        
+                        if t_min <= t_max:
+                            reset = self._get_reset(trans)
+                            if reset:
+                                new_l = reset.lower + max(0.0, d - U + l)
+                                new_u = reset.upper + min(d, d - L + u)
+                            else:
+                                new_l = max(l + d, L)
+                                new_u = min(u + d, U + d)
+                            
+                            if tgt in final_intervals:
+                                old_l, old_u = final_intervals[tgt]
+                                merged_l, merged_u = min(old_l, new_l), max(old_u, new_u)
+                                if merged_l < old_l or merged_u > old_u:
+                                    final_intervals[tgt] = [merged_l, merged_u]
+                                    worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                            else:
+                                final_intervals[tgt] = [new_l, new_u]
+                                worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                                
+            return frozenset(SymbolicState(loc, TimeInterval(l, u, True, True)) for loc, (l, u) in final_intervals.items())
+
+        # ==========================================
+        # Main Graph Construction
+        # ==========================================
+        graph = {}
+        # Apply instant closure to account for unobservables valid at exact start time
+        initial_macrostate = apply_instant_closure(set(self.current_belief))
+        
+        queue = [initial_macrostate]
+        visited = {initial_macrostate}
+        
+        observable_transitions = [t for t in self.transitions if t[1] not in self.unobservable_events]
+        unique_obs_events = {t[1] for t in observable_transitions}
+
+        while queue:
+            curr_macro = queue.pop(0)
+            if curr_macro not in graph:
+                graph[curr_macro] = []
+                
+            # --- PHASE 1: Time Passage ---
+            d = get_time_step(curr_macro)
+            if d > 0 and d != float('inf'):
+                next_macro_time = apply_time_step_and_closure(curr_macro, d)
+                if next_macro_time:
+                    edge_label = f"time -> {d}"
+                    graph[curr_macro].append((edge_label, next_macro_time))
+                    if next_macro_time not in visited:
+                        visited.add(next_macro_time)
+                        queue.append(next_macro_time)
+                        
+            # --- PHASE 2: Observable Events ---
+            for obs_event in unique_obs_events:
+                arrivals = set()
+                for state in curr_macro:
+                    for trans in self.transitions:
+                        src, evt, tgt = trans
+                        if src == state.location and evt == obs_event:
+                            g = self._get_guard(trans)
+                            l, u = state.interval.lower, state.interval.upper
+                            int_l, int_u = max(l, g.lower), min(u, g.upper)
+                            
+                            if int_l <= int_u: # Observable enabled right now
+                                reset = self._get_reset(trans)
+                                new_l = reset.lower if reset else int_l
+                                new_u = reset.upper if reset else int_u
+                                arrivals.add(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
+                
+                if arrivals:
+                    next_macro_obs = apply_instant_closure(arrivals)
+                    graph[curr_macro].append((obs_event, next_macro_obs))
+                    if next_macro_obs not in visited:
+                        visited.add(next_macro_obs)
+                        queue.append(next_macro_obs)
+
         return graph
