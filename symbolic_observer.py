@@ -475,50 +475,64 @@ class SymbolicObserver:
 
         def apply_time_step_and_closure(macrostate: frozenset, d: float) -> frozenset:
             final_intervals = {}
+            
+            # Step 1: Advance time for base states & calculate single-hop unobservables during 'd'
             for state in macrostate:
                 l, u = state.interval.lower, state.interval.upper
                 if l == float('inf'): 
-                    final_intervals[state.location] = [float('inf'), float('inf')]
+                    if state.location not in final_intervals:
+                        final_intervals[state.location] = [float('inf'), float('inf')]
                     continue
                     
+                # 1a. Normal time passage for the base state
                 max_ub = get_max_upper_bound(state.location)
                 if l + d <= max_ub or max_ub == float('inf'):
-                    final_intervals[state.location] = [l + d, u + d if u != float('inf') else float('inf')]
+                    new_l = l + d
+                    new_u = u + d if u != float('inf') else float('inf')
+                    
+                    if max_ub != float('inf'):
+                        new_u = min(new_u, max_ub)
+                    # ----------------------------------------------------------------
+                    
+                    if state.location in final_intervals:
+                        old_l, old_u = final_intervals[state.location]
+                        final_intervals[state.location] = [min(old_l, new_l), max(old_u, new_u)]
+                    else:
+                        final_intervals[state.location] = [new_l, new_u]
 
-            worklist = list(macrostate)
-            while worklist:
-                curr = worklist.pop(0)
-                l, u = curr.interval.lower, curr.interval.upper
-                if l == float('inf'): continue
-                
+                # 1b. Unobservable transitions that fire *during* this time step 'd'
                 for trans in self.transitions:
                     src, evt, tgt = trans
-                    if src == curr.location and evt in self.unobservable_events:
-                        g, L, U = self._get_guard(trans), self._get_guard(trans).lower, self._get_guard(trans).upper
+                    if src == state.location and evt in self.unobservable_events:
+                        g = self._get_guard(trans)
+                        L, U = g.lower, g.upper
                         
+                        # Can it fire during d?
                         t_min = max(0.0, L - u)
                         t_max = min(d, U - l)
                         
                         if t_min <= t_max:
                             reset = self._get_reset(trans)
                             if reset:
+                                # Clock at the end of 'd' depends on when it fired
                                 new_l = reset.lower + max(0.0, d - U + l)
                                 new_u = reset.upper + min(d, d - L + u)
                             else:
+                                # No reset, clock just continues growing
                                 new_l = max(l + d, L)
                                 new_u = min(u + d if u != float('inf') else float('inf'), U + d)
                             
                             if tgt in final_intervals:
                                 old_l, old_u = final_intervals[tgt]
-                                merged_l, merged_u = min(old_l, new_l), max(old_u, new_u)
-                                if merged_l < old_l or merged_u > old_u:
-                                    final_intervals[tgt] = [merged_l, merged_u]
-                                    worklist.append(SymbolicState(tgt, TimeInterval(merged_l, merged_u, True, True)))
+                                final_intervals[tgt] = [min(old_l, new_l), max(old_u, new_u)]
                             else:
                                 final_intervals[tgt] = [new_l, new_u]
-                                worklist.append(SymbolicState(tgt, TimeInterval(new_l, new_u, True, True)))
-                                
-            return frozenset(SymbolicState(loc, TimeInterval(l, u, True, True)) for loc, (l, u) in final_intervals.items())
+
+            # Step 2: Convert to set of SymbolicStates representing exact intervals at the end of 'd'
+            stepped_states = set(SymbolicState(loc, TimeInterval(l, u, True, True)) for loc, (l, u) in final_intervals.items())
+            
+            # Step 3: Apply instant closure to safely catch any 0-time cascades from the newly formed intervals!
+            return apply_instant_closure(stepped_states)
 
         # ==========================================
         # Main Graph Construction
