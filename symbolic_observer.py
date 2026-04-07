@@ -383,9 +383,43 @@ class SymbolicObserver:
         # ==========================================
         # Protection 2: Zone Subsumption Helper
         # ==========================================
-        def is_subsumed(new_macro: frozenset, visited_list: list) -> bool:
-            """Checks if a new macrostate is completely covered by an already visited macrostate."""
+        # def is_subsumed(new_macro: frozenset, visited_list: list) -> bool:
+        #     """Checks if a new macrostate is completely covered by an already visited macrostate."""
+
+        #     new_locations = {s.location for s in new_macro}
+        #     for visited_macro in visited_list:
+        #         visited_locations = {s.location for s in visited_macro}
+        #         if new_locations != visited_locations:
+        #             continue # Different belief spaces cannot subsume each other
+        #         all_covered = True
+                
+        #         for n_state in new_macro:
+        #             state_covered = False
+        #             for v_state in visited_macro:
+        #                 if n_state.location == v_state.location:
+        #                     # Subsumption: new interval is a subset of the visited interval
+        #                     if n_state.interval.lower >= v_state.interval.lower and \
+        #                        n_state.interval.upper <= v_state.interval.upper:
+        #                         state_covered = True
+        #                         break
+                                
+        #             if not state_covered:
+        #                 all_covered = False
+        #                 break
+                        
+        #         if all_covered:
+        #             return True # Fully subsumed by this visited macrostate!
+        #     return False
+
+        def get_subsuming_macro(new_macro: frozenset, visited_list: list):
+            """Returns the visited macrostate that completely covers the new one, or None."""
+            new_locations = {s.location for s in new_macro}
+
             for visited_macro in visited_list:
+                visited_locations = {s.location for s in visited_macro}
+                if new_locations != visited_locations:
+                    continue # Different belief spaces cannot subsume each other
+                
                 all_covered = True
                 
                 for n_state in new_macro:
@@ -403,8 +437,8 @@ class SymbolicObserver:
                         break
                         
                 if all_covered:
-                    return True # Fully subsumed by this visited macrostate!
-            return False
+                    return visited_macro # Found the macrostate that covers it!
+            return None
 
         # ==========================================
         # Existing Logic Helpers (Adapted for inf bounds)
@@ -564,14 +598,28 @@ class SymbolicObserver:
                     next_macro_time = normalize_macrostate(raw_next_time, global_k)
                     
                     edge_label = f"time -> {round(d, 4)}"
-                    graph[curr_macro].append((edge_label, next_macro_time))
-                    if next_macro_time not in graph:
-                        graph[next_macro_time] = []
-                    # ONLY enqueue if this state discovers new information (is not subsumed)
-                    if not is_subsumed(next_macro_time, visited_macros):
+
+                    # graph[curr_macro].append((edge_label, next_macro_time))
+                    # if next_macro_time not in graph:
+                    #     graph[next_macro_time] = []
+                    # # ONLY enqueue if this state discovers new information (is not subsumed)
+                    # if not is_subsumed(next_macro_time, visited_macros):
+                    #     visited_macros.append(next_macro_time)
+                    #     queue.append(next_macro_time)
+                        
+                    subsuming_macro = get_subsuming_macro(next_macro_time, visited_macros)
+                    
+                    if subsuming_macro:
+                        # It is subsumed! Draw the edge to the state that already covers it.
+                        graph[curr_macro].append((edge_label, subsuming_macro))
+                    else:
+                        # It's new! Add it to the graph and queue.
+                        graph[curr_macro].append((edge_label, next_macro_time))
+                        if next_macro_time not in graph:
+                            graph[next_macro_time] = []
                         visited_macros.append(next_macro_time)
                         queue.append(next_macro_time)
-                        
+
             # --- PHASE 2: Observable Events ---
             for obs_event in unique_obs_events:
                 arrivals = set()
@@ -599,11 +647,23 @@ class SymbolicObserver:
                     # Normalize before saving or evaluating
                     next_macro_obs = normalize_macrostate(raw_next_obs, global_k)
                     
-                    graph[curr_macro].append((obs_event, next_macro_obs))
-                    if next_macro_obs not in graph:
-                        graph[next_macro_obs] = []
-                    # ONLY enqueue if this state discovers new information (is not subsumed)
-                    if not is_subsumed(next_macro_obs, visited_macros):
+                    # graph[curr_macro].append((obs_event, next_macro_obs))
+                    # if next_macro_obs not in graph:
+                    #     graph[next_macro_obs] = []
+                    # # ONLY enqueue if this state discovers new information (is not subsumed)
+                    # if not is_subsumed(next_macro_obs, visited_macros):
+                    #     visited_macros.append(next_macro_obs)
+                    #     queue.append(next_macro_obs)
+                    subsuming_macro = get_subsuming_macro(next_macro_obs, visited_macros)
+                    
+                    if subsuming_macro:
+                        # It is subsumed! Draw the edge to the state that already covers it.
+                        graph[curr_macro].append((obs_event, subsuming_macro))
+                    else:
+                        # It's new! Add it to the graph and queue.
+                        graph[curr_macro].append((obs_event, next_macro_obs))
+                        if next_macro_obs not in graph:
+                            graph[next_macro_obs] = []
                         visited_macros.append(next_macro_obs)
                         queue.append(next_macro_obs)
 
